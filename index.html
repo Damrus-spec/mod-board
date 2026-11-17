@@ -104,7 +104,7 @@ const TABS = [
   ["claude", "Claude", i => i.state === "OPEN" && (has(i, "claude") || has(i, "working") || has(i, "failed"))],
   ["me", "For me", i => i.state === "OPEN" && (has(i, "for-damrus") || has(i, "ready"))],
   ["later", "Later", i => i.state === "OPEN" && has(i, "later")],
-  ["done", "Done", i => i.state === "CLOSED"],
+  ["done", "Done", i => i.state === "CLOSED"],  // includes "Won't do" (closed as not planned)
   ["all", "All", () => true],
 ];
 const NOTES = "\n\n## Notes for Claude\n";
@@ -155,7 +155,7 @@ async function load() {
     do {
       const d = await gql(`query($o:String!,$n:String!,$c:String){repository(owner:$o,name:$n){
         issues(first:100,after:$c,orderBy:{field:CREATED_AT,direction:ASC}){pageInfo{hasNextPage endCursor}
-          nodes{id databaseId number title body state createdAt updatedAt url
+          nodes{id databaseId number title body state stateReason createdAt updatedAt url
             labels(first:30){nodes{name}} parent{number} subIssuesSummary{total completed} comments{totalCount}}}}}`,
         { o: cfg.owner, n: cfg.repo, c: cursor });
       const p = d.repository.issues;
@@ -233,18 +233,18 @@ function renderDetail(i) {
   const s = claudeState(i), t = typeOf(i), mod = modOf(i);
   const parents = issues.filter(p => p.number !== i.number && ["epic", "story"].includes(typeOf(p)) && p.state === "OPEN");
   const model = (i.labels.find(l => l.startsWith("model:")) || "").slice(6);
-  const stat = i.state === "CLOSED" ? "done" : has(i, "later") ? "later" : "open";
+  const stat = i.state === "CLOSED" ? (i.stateReason === "NOT_PLANNED" ? "wontdo" : "done") : has(i, "later") ? "later" : "open";
   $("detail").innerHTML = `
   <div class="toprow"><button id="back" onclick="document.body.classList.remove('showdetail')">← List</button>
     ${i.parent && byNum[i.parent] ? `<a href="#" onclick="pick(${i.parent});return false">${esc(byNum[i.parent].title)}</a>` : ""}</div>
   <div class="toprow" style="margin-top:8px"><span>#${i.number} · updated ${new Date(i.updatedAt).toLocaleString()}</span>
     <a href="${i.url}" target="_blank" rel="noopener">GitHub</a><span class="grow"></span>
-    <span id="dirty"></span><button class="primary" onclick="save()">Save</button></div>
+    <span id="dirty"></span><button onclick="del()">Delete</button><button class="primary" onclick="save()">Save</button></div>
   <div class="field"><input id="f-title" value="${esc(i.title)}" oninput="markDirty()"></div>
   <div class="grid">
     <div><label>Type</label><select id="f-type" onchange="markDirty()">${TYPES.map(x => `<option ${x === t ? "selected" : ""}>${x}</option>`).join("")}</select></div>
     <div><label>Priority</label><select id="f-prio" onchange="markDirty()">${["P1", "P2", "P3"].map(x => `<option ${x === prioOf(i) ? "selected" : ""}>${x}</option>`).join("")}</select></div>
-    <div><label>Status</label><select id="f-status" onchange="markDirty()">${[["open", "Open"], ["later", "Later"], ["done", "Done"]].map(([v, n]) => `<option value="${v}" ${v === stat ? "selected" : ""}>${n}</option>`).join("")}</select></div>
+    <div><label>Status</label><select id="f-status" onchange="markDirty()">${[["open", "Open"], ["later", "Later"], ["done", "Done"], ["wontdo", "Won't do"]].map(([v, n]) => `<option value="${v}" ${v === stat ? "selected" : ""}>${n}</option>`).join("")}</select></div>
     <div><label>Mod (folder)</label><input id="f-mod-i" value="${esc((i.labels.find(l => l.startsWith("mod:")) || "").slice(4))}" placeholder="${esc(mod) || "inherits from parent"}" oninput="markDirty()"></div>
     <div style="grid-column: span 2"><label>Parent</label><select id="f-parent" onchange="markDirty()"><option value="">(none)</option>${parents.map(p => `<option value="${p.number}" ${p.number === i.parent ? "selected" : ""}>#${p.number} ${esc(p.title)}</option>`).join("")}</select></div>
     <div style="grid-column: span 2"><label>Labels (comma separated)</label><input id="f-labels" value="${esc(i.labels.filter(l => !/^(type:|P[123]$|mod:|model:|later$|claude$|working$|ready$|failed$|for-damrus$)/.test(l)).join(", "))}" oninput="markDirty()"></div>
@@ -318,10 +318,23 @@ async function save() {
     const notes = $("f-notes").value.trim(), st = $("f-status").value;
     const body = $("f-desc").value.trim() + (notes ? NOTES + notes : "");
     await api(`${R()}/issues/${i.number}`, { method: "PATCH", body: JSON.stringify({
-      title: $("f-title").value.trim(), body, labels: collectLabels(i), state: st === "done" ? "closed" : "open" }) });
+      title: $("f-title").value.trim(), body, labels: collectLabels(i),
+      state: st === "done" || st === "wontdo" ? "closed" : "open",
+      ...(st === "done" ? { state_reason: "completed" } : st === "wontdo" ? { state_reason: "not_planned" } : {}) }) });
     await setParent(i, +$("f-parent").value || null);
     dirty = false; await load();
   } catch (e) { status("Save failed: " + e.message); }
+}
+async function del() {
+  const i = byNum[sel], kids = issues.filter(c => c.parent === i.number).length;
+  if (!confirm(`Delete #${i.number} "${i.title}" permanently?${kids ? ` Its ${kids} child issue(s) stay, without a parent.` : ""} This cannot be undone. (Status "Won't do" closes it instead.)`)) return;
+  status("Deleting…");
+  try {
+    await gql(`mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}`, { id: i.id });
+    dirty = false; sel = null; $("detail").innerHTML = `<div class="empty">Deleted #${i.number}.</div>`; await load();
+  } catch (e) {
+    status(/permission|access/i.test(e.message) ? "Delete needs the token permission Administration: Read and write" : "Delete failed: " + e.message);
+  }
 }
 async function setClaude(on) {
   const i = byNum[sel];
