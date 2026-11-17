@@ -73,10 +73,11 @@ main { display: grid; grid-template-columns: minmax(0, 46%) minmax(0, 1fr); heig
 <div id="login" hidden>
   <h1>Mod Tracker</h1>
   <p>Paste a GitHub fine-grained token with access to the tracker repo only (Issues: read and write, Contents: read and write). It is stored in this browser only.</p>
-  <label>Owner</label><input id="l-owner" placeholder="github login">
+  <label>Owner</label><input id="l-owner" value="Damrus-spec">
   <label>Repo</label><input id="l-repo" value="cosmoteer-mods-tracker">
   <label>Token</label><input id="l-token" type="password" placeholder="github_pat_...">
   <button class="primary" onclick="saveLogin()">Connect</button>
+  <p id="l-error" style="color:var(--bug)"></p>
 </div>
 <div id="app" hidden>
 <header>
@@ -119,8 +120,13 @@ const modOf = i => { for (let x = i, n = 0; x && n < 10; x = byNum[x.parent], n+
 const claudeState = i => ["working", "failed", "claude", "for-damrus", "ready"].find(l => has(i, l)) || "";
 const STATE_TEXT = { claude: "Queued for Claude", working: "Claude is working", failed: "Worker failed", "for-damrus": "Needs you", ready: "Ready to test", "": "Not assigned" };
 
-function saveLogin() {
-  cfg = { owner: $("l-owner").value.trim(), repo: $("l-repo").value.trim(), token: $("l-token").value.trim() };
+async function saveLogin() {
+  cfg = { owner: $("l-owner").value.trim().replace(/^.*github\.com\//, "").replace(/\/.*$/, ""),
+          repo: $("l-repo").value.trim(), token: $("l-token").value.trim() };
+  try {  // check before saving: owner/repo must exist and the token must be able to write issues
+    const r = await api(R());
+    if (!r.permissions || !r.permissions.push) throw new Error("the token can read the repo but not write to it (set Issues and Contents to Read and write)");
+  } catch (e) { $("l-error").textContent = "Cannot connect: " + e.message; return; }
   try { localStorage.setItem("tracker.cfg", JSON.stringify(cfg)); } catch (e) {}
   start();
 }
@@ -131,7 +137,7 @@ async function api(path, opts = {}) {
   const r = await fetch("https://api.github.com" + path, { ...opts, headers: {
     Authorization: "Bearer " + cfg.token, Accept: opts.accept || "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28", ...(opts.body ? { "Content-Type": "application/json" } : {}) } });
-  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
+  if (!r.ok) throw new Error(`${r.status} on ${opts.method || "GET"} ${path}: ${(await r.text()).slice(0, 160)}`);
   if (opts.accept === "application/vnd.github.raw") return r.blob();
   return r.status === 204 ? null : r.json();
 }
@@ -379,7 +385,7 @@ $("f-mod").addEventListener("change", () => { renderTabs(); renderList(); });
 window.addEventListener("beforeunload", e => { if (dirty) e.preventDefault(); });
 
 function start() {
-  if (!cfg.token) { $("login").hidden = false; $("app").hidden = true; $("l-owner").value = cfg.owner || ""; return; }
+  if (!cfg.token) { $("login").hidden = false; $("app").hidden = true; if (cfg.owner) $("l-owner").value = cfg.owner; return; }
   $("login").hidden = true; $("app").hidden = false; load();
   setInterval(() => { if (!dirty && document.visibilityState === "visible") load(); }, 60000);
 }
