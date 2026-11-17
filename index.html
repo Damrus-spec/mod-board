@@ -149,7 +149,7 @@ async function gql(query, variables) {
 const R = () => `/repos/${cfg.owner}/${cfg.repo}`;
 
 async function load() {
-  status("Loading…");
+  if (!issues.length) status("Loading…");
   try {
     const all = []; let cursor = null;
     do {
@@ -162,6 +162,7 @@ async function load() {
       p.nodes.forEach(i => { i.labels = i.labels.nodes.map(l => l.name); i.parent = i.parent && i.parent.number; });
       all.push(...p.nodes); cursor = p.pageInfo.hasNextPage ? p.pageInfo.endCursor : null;
     } while (cursor);
+    if (pending) return;  // a write started while this was loading: this data may predate it; send() reloads after
     issues = all; byNum = Object.fromEntries(all.map(i => [i.number, i]));
     const mods = [...new Set(all.map(modOf).filter(Boolean))].sort();
     const fm = $("f-mod"), cur = fm.value;
@@ -169,7 +170,8 @@ async function load() {
     fm.value = cur;
     status("Connected: " + cfg.owner + "/" + cfg.repo);
     renderTabs(); renderList();
-    if (sel && byNum[sel] && !dirty) renderDetail(byNum[sel]);
+    // Keep the detail pane as is while you type (edits or a comment draft) or while a write is still on its way.
+    if (sel && byNum[sel] && !dirty && !pending && !($("f-comment") && $("f-comment").value)) renderDetail(byNum[sel]);
   } catch (e) { status("Error: " + e.message); }
 }
 
@@ -311,50 +313,58 @@ async function setParent(i, parentNum) {
   if (i.parent) await api(`${R()}/issues/${i.parent}/sub_issue`, { method: "DELETE", body: JSON.stringify({ sub_issue_id: i.databaseId }) });
   if (parentNum) await api(`${R()}/issues/${parentNum}/sub_issues`, { method: "POST", body: JSON.stringify({ sub_issue_id: i.databaseId, replace_parent: true }) });
 }
-async function save() {
-  const i = byNum[sel]; if (!i) return;
-  status("Saving…");
-  try {
-    const notes = $("f-notes").value.trim(), st = $("f-status").value;
-    const body = $("f-desc").value.trim() + (notes ? NOTES + notes : "");
-    await api(`${R()}/issues/${i.number}`, { method: "PATCH", body: JSON.stringify({
-      title: $("f-title").value.trim(), body, labels: collectLabels(i),
-      state: st === "done" || st === "wontdo" ? "closed" : "open",
-      ...(st === "done" ? { state_reason: "completed" } : st === "wontdo" ? { state_reason: "not_planned" } : {}) }) });
-    await setParent(i, +$("f-parent").value || null);
-    dirty = false; await load();
-  } catch (e) { status("Save failed: " + e.message); }
+// Writes update the screen at once and go to GitHub in the background (one call each where GitHub allows).
+// While any write is in flight, background reloads wait, so they can't undo what the screen shows.
+let pending = 0;
+function refresh() { renderTabs(); renderList(); if (sel && byNum[sel]) renderDetail(byNum[sel]); }
+function send(label, work) {
+  pending++; status(label + "…");
+  work().then(() => status("Saved"), e => { status(label + " failed: " + e.message); dirty = false; })
+    .finally(() => { if (--pending === 0) load(); });
 }
-async function del() {
+function formFields(i) {
+  const notes = $("f-notes").value.trim(), st = $("f-status").value;
+  return { title: $("f-title").value.trim(), body: $("f-desc").value.trim() + (notes ? NOTES + notes : ""),
+    labels: collectLabels(i), state: st === "done" || st === "wontdo" ? "closed" : "open",
+    ...(st === "done" ? { state_reason: "completed" } : st === "wontdo" ? { state_reason: "not_planned" } : {}) };
+}
+function applyLocal(i, f) {
+  if (f.title != null) i.title = f.title;
+  if (f.body != null) i.body = f.body;
+  if (f.labels) i.labels = f.labels;
+  if (f.state) { i.state = f.state.toUpperCase(); i.stateReason = f.state_reason ? f.state_reason.toUpperCase() : null; }
+  i.updatedAt = new Date().toISOString();
+}
+// extra(labels) -> labels lets Mark for Claude send unsaved edits and the label change in the same call.
+function save(extra) {
+  const i = byNum[sel]; if (!i) return;
+  const f = dirty ? formFields(i) : { labels: [...i.labels] };
+  if (extra) f.labels = extra(f.labels);
+  const oldParent = i.parent || null, parent = dirty ? (+$("f-parent").value || null) : oldParent;
+  applyLocal(i, f); i.parent = parent; dirty = false; refresh();
+  send("Saving", async () => {
+    await api(`${R()}/issues/${i.number}`, { method: "PATCH", body: JSON.stringify(f) });
+    await setParent({ ...i, parent: oldParent }, parent);
+  });
+}
+function setClaude(on) {
+  save(ls => on ? [...ls.filter(l => !["failed", "for-damrus", "ready"].includes(l)), "claude"] : ls.filter(l => l !== "claude"));
+}
+function del() {
   const i = byNum[sel], kids = issues.filter(c => c.parent === i.number).length;
   if (!confirm(`Delete #${i.number} "${i.title}" permanently?${kids ? ` Its ${kids} child issue(s) stay, without a parent.` : ""} This cannot be undone. (Status "Won't do" closes it instead.)`)) return;
-  status("Deleting…");
-  try {
-    await gql(`mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}`, { id: i.id });
-    dirty = false; sel = null; $("detail").innerHTML = `<div class="empty">Deleted #${i.number}.</div>`; await load();
-  } catch (e) {
-    status(/permission|access/i.test(e.message) ? "Delete needs the token permission Administration: Read and write" : "Delete failed: " + e.message);
-  }
+  issues = issues.filter(x => x !== i); delete byNum[i.number]; sel = null; dirty = false;
+  $("detail").innerHTML = `<div class="empty">Deleted #${i.number}.</div>`; renderTabs(); renderList();
+  send("Deleting", () => gql(`mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}`, { id: i.id }).catch(e => {
+    throw /permission|access/i.test(e.message) ? new Error("the token needs Administration: Read and write") : e; }));
 }
-async function setClaude(on) {
-  const i = byNum[sel];
-  if (dirty) await save();
-  status(on ? "Marking for Claude…" : "Unmarking…");
-  try {
-    if (on) {
-      await api(`${R()}/issues/${i.number}/labels`, { method: "POST", body: JSON.stringify({ labels: ["claude"] }) });
-      for (const l of ["failed", "for-damrus", "ready"]) if (has(i, l)) await api(`${R()}/issues/${i.number}/labels/${l}`, { method: "DELETE" });
-    } else await api(`${R()}/issues/${i.number}/labels/claude`, { method: "DELETE" });
-    await load();
-  } catch (e) { status("Error: " + e.message); }
-}
-async function postComment() {
+function postComment() {
   const i = byNum[sel], text = $("f-comment").value.trim(); if (!text) return;
-  status("Posting…");
-  try {
-    await api(`${R()}/issues/${i.number}/comments`, { method: "POST", body: JSON.stringify({ body: ($("f-tc").checked ? TO_CLAUDE + "\n" : "") + text }) });
-    $("f-comment").value = ""; await load(); loadComments(byNum[i.number]);
-  } catch (e) { status("Error: " + e.message); }
+  const body = ($("f-tc").checked ? TO_CLAUDE + "\n" : "") + text;
+  $("f-comment").value = ""; i.comments.totalCount++;
+  const box = $("comments"); if (box.querySelector(".empty")) box.innerHTML = "";
+  box.insertAdjacentHTML("beforeend", `<div class="comment"><div class="who">${esc(cfg.owner)} · sending…${body.startsWith(TO_CLAUDE) ? ` <span class="tc">· sent to Claude</span>` : ""}</div><div class="md">${md(text)}</div></div>`);
+  send("Posting", () => api(`${R()}/issues/${i.number}/comments`, { method: "POST", body: JSON.stringify({ body }) }));
 }
 async function uploadFiles(files) {
   const i = byNum[sel]; if (!i) return;
@@ -369,7 +379,8 @@ async function uploadFiles(files) {
       const cur = byNum[i.number].body || "", [d, n] = splitBody(cur);
       const nb = (d + `\n\n![screenshot](${path})`).trim() + (n ? NOTES + n : "");
       await api(`${R()}/issues/${i.number}`, { method: "PATCH", body: JSON.stringify({ body: nb }) });
-      if (!dirty) { await load(); } else { $("f-desc").value += `\n\n![screenshot](${path})`; byNum[i.number].body = nb; showShots(byNum[i.number]); }
+      byNum[i.number].body = nb;
+      if (!dirty) renderDetail(byNum[i.number]); else { $("f-desc").value += `\n\n![screenshot](${path})`; showShots(byNum[i.number]); }
     } catch (e) { status("Upload failed: " + e.message); return; }
   }
   status("Uploaded");
@@ -386,11 +397,17 @@ async function newIssue() {
   const mod = p && modOf(p);
   status("Creating…");
   try {
+    pending++;  // hold background reloads until the parent link is made too
     const r = await api(`${R()}/issues`, { method: "POST", body: JSON.stringify({ title, labels: ["type:" + type, "P2", ...(mod ? ["mod:" + mod] : [])] }) });
-    if (p) await api(`${R()}/issues/${p.number}/sub_issues`, { method: "POST", body: JSON.stringify({ sub_issue_id: r.id }) });
+    const i = { id: r.node_id, databaseId: r.id, number: r.number, title, body: "", state: "OPEN", stateReason: null,
+      createdAt: r.created_at, updatedAt: r.updated_at, url: r.html_url, labels: r.labels.map(l => l.name),
+      parent: p ? p.number : null, subIssuesSummary: { total: 0, completed: 0 }, comments: { totalCount: 0 } };
+    issues.push(i); byNum[i.number] = i;
     if (p) open[p.number] = true;
-    dirty = false; sel = r.number; await load(); renderDetail(byNum[r.number]);
-  } catch (e) { status("Error: " + e.message); }
+    dirty = false; sel = i.number; refresh(); pending--;
+    if (p) send("Linking to parent", () => api(`${R()}/issues/${p.number}/sub_issues`, { method: "POST", body: JSON.stringify({ sub_issue_id: r.id }) }));
+    else status("Created #" + i.number);
+  } catch (e) { pending = Math.max(0, pending - 1); status("Error: " + e.message); }
 }
 document.addEventListener("keydown", e => { if (e.key === "/" && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) { e.preventDefault(); $("search").focus(); } });
 $("search").addEventListener("input", () => { renderTabs(); renderList(); });
@@ -400,7 +417,7 @@ window.addEventListener("beforeunload", e => { if (dirty) e.preventDefault(); })
 function start() {
   if (!cfg.token) { $("login").hidden = false; $("app").hidden = true; if (cfg.owner) $("l-owner").value = cfg.owner; return; }
   $("login").hidden = true; $("app").hidden = false; load();
-  setInterval(() => { if (!dirty && document.visibilityState === "visible") load(); }, 60000);
+  setInterval(() => { if (!dirty && !pending && document.visibilityState === "visible") load(); }, 60000);
 }
 start();
 </script>
