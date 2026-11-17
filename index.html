@@ -266,7 +266,7 @@ function renderDetail(i) {
   <textarea id="f-comment" rows="3" placeholder="Add a comment… (Ctrl+Enter to post)"></textarea>
   <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
     <button class="primary" onclick="postComment()">Comment</button>
-    <label><input type="checkbox" id="f-tc"> also send to Claude</label></div>`;
+    <label><input type="checkbox" id="f-tc" checked> also send to Claude</label></div>`;
   $("f-comment").addEventListener("keydown", e => { if (e.key === "Enter" && e.ctrlKey) postComment(); });
   const drop = $("drop");
   drop.addEventListener("dragover", e => e.preventDefault());
